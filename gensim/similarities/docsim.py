@@ -58,6 +58,7 @@ import heapq
 
 import numpy
 import scipy.sparse
+import sklearn
 
 from gensim import interfaces, utils, matutils
 from six.moves import map as imap, xrange, zip as izip
@@ -147,23 +148,30 @@ def query_shard(args):
 # Array of terms with a posting list.
 # TODO: make this SaveLoad'able?
 class ReverseIndex(object):
-    def __init__(self, num_features=0):
+    def __init__(self, num_documents=None, num_features=None):
+        if num_documents is None:
+            raise ValueError("refusing to guess the number of documents: specify num_documents explicitly")
         if num_features is None:
             raise ValueError("refusing to guess the number of features: specify num_features explicitly")
+        self.num_documents = num_documents
         self.num_features = num_features
-        self.index = [[] for k in xrange(num_features)]
+        #self.index = [[] for k in xrange(num_features)]
+        self.index = scipy.sparse.dok_matrix((self.num_features, self.num_documents), dtype=numpy.bool)
 
     def add_doc(self, docid, features):
-        for f in features:
-            print "Feature:", f
-            self.index[f].append(docid)
+        cx = features.tocoo()
+        for f in cx.col:
+            self.index[f, docid] = True
 
-    def __getitem__(self, features):
-        docs = set()
-        for f in features:
-            for d in self.index[f]:
-                docs.add(d)
-        return docs
+    def finalize(self):
+        self.index = self.index.tocsr()
+
+    def __getitem__(self, f):
+        res = []
+        coords = self.index[f:].tocoo()
+        for docno in coords.col:
+            res.append(docno)
+        return res
 #endclass ReverseIndex
 
 
@@ -178,7 +186,7 @@ class Similarity(interfaces.SimilarityABC):
 
     """
     def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768,
-                 use_reverse_index=True):
+                 use_reverse_index=False):
         """
         Construct the index from `corpus`. The index can be later extended by calling
         the `add_documents` method. **Note**: documents are split (internally, transparently)
@@ -228,16 +236,27 @@ class Similarity(interfaces.SimilarityABC):
         self.fresh_docs, self.fresh_nnz = [], 0
         self.use_reverse_index = use_reverse_index
 
+        """
         if self.use_reverse_index:
-            self.reverse_index = ReverseIndex(num_features = self.num_features)
+            self.reverse_index = ReverseIndex(num_documents = len(corpus), num_features = self.num_features)
+        """
 
         if corpus is not None:
             self.add_documents(corpus)
 
+    # Rebuild the reverse index (or build one if it was never built).
+    def rebuild_reverse_index(self, progress_cnt=10000):
+        num_docs = len(self)
+        self.reverse_index = ReverseIndex(num_documents = len(self), num_features = self.num_features)
+        for docno in xrange(len(self)):
+            if docno % progress_cnt == 0:
+                logger.info("PROGRESS: adding document #%i of #%i to reverse index" % (docno, num_docs))
+            vec = self.vector_by_id(docno)
+            self.reverse_index.add_doc(docno, vec)
+        self.reverse_index.finalize()
 
     def __len__(self):
         return len(self.fresh_docs) + sum([len(shard) for shard in self.shards])
-
 
     def __str__(self):
         return ("Similarity index with %i documents in %i shards (stored under %s)" %
@@ -268,13 +287,20 @@ class Similarity(interfaces.SimilarityABC):
                     doc = matutils.unitvec(matutils.sparse2full(doc, self.num_features))
             self.fresh_docs.append(doc)
             self.fresh_nnz += doclen
+            """
             if self.use_reverse_index:
                 self.reverse_index.add_doc(docpos, doc)
+            """
 
             if len(self.fresh_docs) >= self.shardsize:
                 self.close_shard()
             if len(self.fresh_docs) % 10000 == 0:
                 logger.info("PROGRESS: fresh_shard size=%i" % len(self.fresh_docs))
+
+        """
+        if self.use_reverse_index:
+            self.reverse_index.finalize()
+        """
 
 
     def shardid2filename(self, shardid):
@@ -361,11 +387,31 @@ class Similarity(interfaces.SimilarityABC):
             shard.num_best = self.num_best
             shard.normalize = self.normalize
 
+        # Hack that only works with an in-memory reverse index and single-document query.
+        if self.use_reverse_index:
+            docs = set()
+            scipy_query = scipy.sparse.dok_matrix((1, self.num_features), dtype=numpy.float64)
+            for termid, score in query:
+                #print self.reverse_index[termid]
+                docs.update(self.reverse_index[termid])
+                scipy_query[0, termid] = score
+            scipy_query = scipy_query.tocsr()
+            results = []
+            for doc_idx in docs:
+                vec = self.vector_by_id(doc_idx)
+                similarity = sklearn.metrics.pairwise.cosine_similarity(scipy_query, vec)
+                results.append((doc_idx, similarity))
+            pool = None
+            shard_results = [results]
+            #return results
+
+        else:
+            pool, shard_results = self.query_shards(query)
+
         # there are 4 distinct code paths, depending on whether input `query` is
         # a corpus (or numpy/scipy matrix) or a single document, and whether the
         # similarity result should be a full array or only num_best most similar
         # documents.
-        pool, shard_results = self.query_shards(query)
         if self.num_best is None:
             # user asked for all documents => just stack the sub-results into a single matrix
             # (works for both corpus / single doc query)

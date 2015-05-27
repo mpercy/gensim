@@ -143,28 +143,39 @@ def query_shard(args):
     logger.debug("finished querying shard %s in process %s" % (shard, os.getpid()))
     return result
 
+# TODO: Shard the reverse indexes.
+# Do an iterative build / spill first pass.
+# Then do a merging 2nd pass to partition based on term and shard size.
+class ReverseIndexShard(utils.SaveLoad):
+    pass
 
 # A reverse index for large similarity matrices.
 # Array of terms with a posting list.
 # TODO: make this SaveLoad'able?
-class ReverseIndex(object):
-    def __init__(self, num_documents=None, num_features=None):
+class ReverseIndex(utils.SaveLoad):
+    def __init__(self, num_documents=None, num_features=None, num_shards=1):
         if num_documents is None:
             raise ValueError("refusing to guess the number of documents: specify num_documents explicitly")
         if num_features is None:
             raise ValueError("refusing to guess the number of features: specify num_features explicitly")
+        # TODO: Support the shards.
         self.num_documents = num_documents
         self.num_features = num_features
-        #self.index = [[] for k in xrange(num_features)]
-        self.index = scipy.sparse.dok_matrix((self.num_features, self.num_documents), dtype=numpy.bool)
+        self.doc_indexes = []
+        self.term_indexes = []
 
-    def add_doc(self, docid, features):
-        cx = features.tocoo()
-        for f in cx.col:
-            self.index[f, docid] = True
+    def add_doc(self, docno, features):
+        rows, cols = features.nonzero()
+        for term in cols:
+            self.term_indexes.append(term)
+            self.doc_indexes.append(docno)
 
     def finalize(self):
-        self.index = self.index.tocsr()
+        # Store as a numpy sparse index.
+        self.index = scipy.sparse.csr_matrix( ([True] * len(self.term_indexes), (self.term_indexes, self.doc_indexes)) )
+        # We don't want these fields to get pickled.
+        del self.term_indexes
+        del self.doc_indexes
 
     def __getitem__(self, f):
         res = []
@@ -250,7 +261,7 @@ class Similarity(interfaces.SimilarityABC):
         self.reverse_index = ReverseIndex(num_documents = len(self), num_features = self.num_features)
         for docno in xrange(len(self)):
             if docno % progress_cnt == 0:
-                logger.info("PROGRESS: adding document #%i of #%i to reverse index" % (docno, num_docs))
+                logger.info("PROGRESS: adding document #%i of %i to reverse index" % (docno, num_docs))
             vec = self.vector_by_id(docno)
             self.reverse_index.add_doc(docno, vec)
         self.reverse_index.finalize()

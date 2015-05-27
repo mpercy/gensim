@@ -143,6 +143,29 @@ def query_shard(args):
     return result
 
 
+# A reverse index for large similarity matrices.
+# Array of terms with a posting list.
+# TODO: make this SaveLoad'able?
+class ReverseIndex(object):
+    def __init__(self, num_features=0):
+        if num_features is None:
+            raise ValueError("refusing to guess the number of features: specify num_features explicitly")
+        self.num_features = num_features
+        self.index = [[] for k in xrange(num_features)]
+
+    def add_doc(self, docid, features):
+        for f in features:
+            print "Feature:", f
+            self.index[f].append(docid)
+
+    def __getitem__(self, features):
+        docs = set()
+        for f in features:
+            for d in self.index[f]:
+                docs.add(d)
+        return docs
+#endclass ReverseIndex
+
 
 class Similarity(interfaces.SimilarityABC):
     """
@@ -154,7 +177,8 @@ class Similarity(interfaces.SimilarityABC):
     The shards themselves are simply stored as files to disk and mmap'ed back as needed.
 
     """
-    def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768):
+    def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768,
+                 use_reverse_index=True):
         """
         Construct the index from `corpus`. The index can be later extended by calling
         the `add_documents` method. **Note**: documents are split (internally, transparently)
@@ -202,6 +226,10 @@ class Similarity(interfaces.SimilarityABC):
         self.shardsize = shardsize
         self.shards = []
         self.fresh_docs, self.fresh_nnz = [], 0
+        self.use_reverse_index = use_reverse_index
+
+        if self.use_reverse_index:
+            self.reverse_index = ReverseIndex(num_features = self.num_features)
 
         if corpus is not None:
             self.add_documents(corpus)
@@ -227,7 +255,7 @@ class Similarity(interfaces.SimilarityABC):
         if self.shards and len(self.shards[-1]) < min_ratio * self.shardsize:
             # The last shard was incomplete (<; load it back and add the documents there, don't start a new shard
             self.reopen_shard()
-        for doc in corpus:
+        for docpos, doc in enumerate(corpus):
             if isinstance(doc, numpy.ndarray):
                 doclen = len(doc)
             elif scipy.sparse.issparse(doc):
@@ -240,6 +268,9 @@ class Similarity(interfaces.SimilarityABC):
                     doc = matutils.unitvec(matutils.sparse2full(doc, self.num_features))
             self.fresh_docs.append(doc)
             self.fresh_nnz += doclen
+            if self.use_reverse_index:
+                self.reverse_index.add_doc(docpos, doc)
+
             if len(self.fresh_docs) >= self.shardsize:
                 self.close_shard()
             if len(self.fresh_docs) % 10000 == 0:

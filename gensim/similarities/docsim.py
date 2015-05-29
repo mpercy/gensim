@@ -143,15 +143,8 @@ def query_shard(args):
     logger.debug("finished querying shard %s in process %s" % (shard, os.getpid()))
     return result
 
-# TODO: Shard the reverse indexes.
-# Do an iterative build / spill first pass.
-# Then do a merging 2nd pass to partition based on term and shard size.
-class ReverseIndexShard(utils.SaveLoad):
-    pass
-
 # A reverse index for large similarity matrices.
 # Array of terms with a posting list.
-# TODO: make this SaveLoad'able?
 class ReverseIndex(utils.SaveLoad):
     def __init__(self, num_documents=None, num_features=None, num_shards=1):
         if num_documents is None:
@@ -163,14 +156,24 @@ class ReverseIndex(utils.SaveLoad):
         self.num_features = num_features
         self.doc_indexes = []
         self.term_indexes = []
+        self.finalized = False
+
+    def __len__(self):
+        return self.num_features
 
     def add_doc(self, docno, features):
+        if self.finalized:
+            raise ValueError("cannot add documents to a finalized ReverseIndex")
         rows, cols = features.nonzero()
         for term in cols:
             self.term_indexes.append(term)
             self.doc_indexes.append(docno)
 
     def finalize(self):
+        if self.finalized:
+            return
+        self.finalized = True
+
         # Store as a numpy sparse index.
         self.index = scipy.sparse.csr_matrix( ([True] * len(self.term_indexes), (self.term_indexes, self.doc_indexes)) )
         # We don't want these fields to get pickled.
@@ -178,13 +181,51 @@ class ReverseIndex(utils.SaveLoad):
         del self.doc_indexes
 
     def __getitem__(self, f):
-        res = []
+        docs = []
         coords = self.index[f:].tocoo()
         for docno in coords.col:
-            res.append(docno)
-        return res
+            docs.append(docno)
+        return docs
 #endclass ReverseIndex
 
+class ReverseIndexShard(utils.SaveLoad):
+    def __init__(self, fname, index):
+        self.dirname, self.fname = os.path.split(fname)
+        self.length = len(index)
+        self.cls = index.__class__
+        logger.info("saving ReverseIndex shard to %s" % self.fullpath())
+        if not index.finalized:
+            raise ValueError("cannot save unfinalized ReverseIndex")
+        index.save(self.fullpath())
+        self.index = self.get_index()
+
+    def fullpath(self):
+        return os.path.join(self.dirname, self.fname)
+
+    def __len__(self):
+        return self.length
+
+    def __getstate__(self):
+        result = self.__dict__.copy()
+        # ReverseIndex objects must be loaded via load() because of mmap
+        # (simple pickle.load won't do).
+        if 'index' in result:
+            del result['index']
+        return result
+
+    def __str__(self):
+        return ("%s ReverseIndexShard(%i terms in %s)" %
+                (self.cls.__name__, len(self), self.fullpath()))
+
+    def get_index(self):
+        if not hasattr(self, 'index'):
+            logger.debug("mmaping index from %s" % self.fullpath())
+            self.index = self.cls.load(self.fullpath(), mmap='r')
+        return self.index
+
+    def __getitem__(self, f):
+        index = self.get_index()
+        return index[f]
 
 class Similarity(interfaces.SimilarityABC):
     """
@@ -247,10 +288,8 @@ class Similarity(interfaces.SimilarityABC):
         self.fresh_docs, self.fresh_nnz = [], 0
         self.use_reverse_index = use_reverse_index
 
-        """
         if self.use_reverse_index:
-            self.reverse_index = ReverseIndex(num_documents = len(corpus), num_features = self.num_features)
-        """
+            self.reverse_index = ReverseIndex(num_documents=len(corpus), num_features=self.num_features)
 
         if corpus is not None:
             self.add_documents(corpus)
@@ -265,6 +304,7 @@ class Similarity(interfaces.SimilarityABC):
             vec = self.vector_by_id(docno)
             self.reverse_index.add_doc(docno, vec)
         self.reverse_index.finalize()
+        self.reverse_index = ReverseIndexShard("%s.rindex" % (self.output_prefix,), self.reverse_index)
 
     def __len__(self):
         return len(self.fresh_docs) + sum([len(shard) for shard in self.shards])
@@ -298,20 +338,17 @@ class Similarity(interfaces.SimilarityABC):
                     doc = matutils.unitvec(matutils.sparse2full(doc, self.num_features))
             self.fresh_docs.append(doc)
             self.fresh_nnz += doclen
-            """
             if self.use_reverse_index:
                 self.reverse_index.add_doc(docpos, doc)
-            """
 
             if len(self.fresh_docs) >= self.shardsize:
                 self.close_shard()
             if len(self.fresh_docs) % 10000 == 0:
                 logger.info("PROGRESS: fresh_shard size=%i" % len(self.fresh_docs))
 
-        """
         if self.use_reverse_index:
             self.reverse_index.finalize()
-        """
+            self.reverse_index = ReverseIndexShard("%s.rindex" % (self.output_prefix,), self.reverse_index)
 
 
     def shardid2filename(self, shardid):

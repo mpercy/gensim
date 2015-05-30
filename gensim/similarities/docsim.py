@@ -286,7 +286,7 @@ class Similarity(interfaces.SimilarityABC):
             ri = ReverseIndex(shard.get_index().index.transpose().tocsr(),
                               num_features=self.num_features, num_documents=len(self))
             ri_shard = ReverseIndexShard("%s.rindex.%d" %
-                                         (self.output_prefix, len(self.ri_shards)), ri)
+                                         (self.output_prefix, len(ri_docpart_shards)), ri)
             ri_docpart_shards.append(ri_shard)
 
         logger.info("=====================================")

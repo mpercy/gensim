@@ -528,6 +528,24 @@ class Similarity(interfaces.SimilarityABC):
         #logger.info("returning...")
         return result
 
+
+    def docs_by_feature_id(self, feature_id):
+        """
+        Return indexed vector corresponding to documents with feature `feature_id`.
+        """
+        shard_start = 0
+        for ri_shard in self.ri_shards:
+            shard_end = shard_start + len(ri_shard)
+            if feature_id < shard_end:
+                break
+            shard_start = shard_end
+        if not self.ri_shards or feature_id < 0 or feature_id >= shard_end:
+            raise ValueError("invalid document position: %s (must be 0 <= x < %s)" %
+                             (feature_id, len(self)))
+        shard_feature_offset = feature_id - shard_start
+        return ri_shard[shard_feature_offset]
+
+
     def __getitem__(self, query):
 
         """Get similarities of document `query` to all documents in the corpus.

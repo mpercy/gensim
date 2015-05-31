@@ -51,6 +51,7 @@ already uses the faster, batch queries internally:
 """
 
 
+from array import array
 import logging
 import math
 import itertools
@@ -477,13 +478,14 @@ class Similarity(interfaces.SimilarityABC):
         return pool, result
 
     def query_reverse_index_shards(self, query):
-        logger.debug("DEBUG: querying with query %s" % (query,))
+        logger.info("DEBUG: querying with query %s" % (query,))
 
+        # Slice out the rows we want from the term-order reverse indexes.
         qlen = len(query)
         i = 0
         relevant_docs = []
         for shard_idx, ri_shard in enumerate(self.ri_shards):
-            logger.debug("DEBUG: querying shard %s" % (ri_shard.fname,))
+            #logger.debug("DEBUG: querying shard %s" % (ri_shard.fname,))
             start = shard_idx * self.ri_shardsize
             end = start + len(ri_shard)
             # accumulate terms that apply to that shard
@@ -493,34 +495,54 @@ class Similarity(interfaces.SimilarityABC):
                 i += 1
             if not selections:
                 continue
+            #logger.info("querying shard %d with selections: %s" % (shard_idx, selections))
             # Slice doc rows from that shard for each term.
             shard_relevant_docs = ri_shard.get_index().index[numpy.array(selections)]
+            #logger.info("done querying shard")
             relevant_docs.append(shard_relevant_docs)
 
-        # vstack returned rows.
-        # take as coo so that we can renumber the term row indexes after slicing.
-        rdocs = scipy.sparse.vstack(relevant_docs, format='coo')
-        for i, rowno in enumerate(rdocs.row):
-            rdocs.row[i] = query[rowno][0]
+        logger.info("vstacking rows and transposing...")
+        # vstack returned rows, then transpose and make the whole thing document-order.
+        trimmed_corpus = scipy.sparse.vstack(relevant_docs, format='csr').transpose().tocsr()
 
-        # HACK: reshape() is not implemented for scipy.sparse matrices, which
-        # is a bit silly. This apparently violates encapsulation, but works.
-        # We want to retain the conceptual original # rows after slicing.
-        #rdocs._shape = (self.num_features, len(self))
+        # Now reindex the features.
+        # FIXME: This takes up the majority of the time for large docs. It can take seconds.
+        """
+        logger.info("building mapping...")
+        feature_offset_id_map = array('l', [term[0] for term in query])
+        logger.info("reindexing...")
+        for i in xrange(len(trimmed_corpus.indices)):
+            trimmed_corpus.indices[i] = feature_offset_id_map[trimmed_corpus.indices[i]]
+        """
 
-        # Transpose returned docs and change to csr()
-        trimmed_corpus = rdocs.tocsc().transpose() # Gives us doc-order csr matrix.
-        trimmed_corpus._shape = (len(self), self.num_features)
+        # Now reindex the features.
+        # The below is a fast reindexing solution from the interwebz @
+        # http://stackoverflow.com/questions/13572448/change-values-in-a-numpy-array
+        logger.info("building mapping...")
+        palette = range(len(query))
+        feature_offset_id_map = numpy.array([term[0] for term in query])
+        logger.info("reindexing...")
+        dindex = numpy.digitize(trimmed_corpus.indices, palette, right=True)
+        trimmed_corpus = scipy.sparse.csr_matrix((trimmed_corpus.data,
+                                                  feature_offset_id_map[dindex].reshape(trimmed_corpus.indices.shape),
+                                                  trimmed_corpus.indptr),
+                                                 shape=(len(self), self.num_features))
 
+        logger.info("foo")
+        logger.info("csr num non-zero elements: %d" % (trimmed_corpus.nnz,))
+
+        #logger.info("running corpus2csc()...")
         # Change query from gensim sparse format to single-doc csr.
         query = matutils.corpus2csc([query], num_terms=self.num_features, num_docs=1, num_nnz=len(query))
 
+        #logger.info("performing dot product...")
         result = trimmed_corpus * query # N x T * T x C = N x C
+        #logger.info("flattening...")
         result = result.toarray().flatten()
         #result = sklearn.metrics.pairwise.cosine_similarity(trimmed_corpus, query).flatten()
 
-        pool = None
-        return pool, list(result)
+        #logger.info("returning...")
+        return result
 
     def __getitem__(self, query):
 
@@ -539,11 +561,10 @@ class Similarity(interfaces.SimilarityABC):
             shard.num_best = self.num_best
             shard.normalize = self.normalize
 
-        used_reverse_index = False
         if self.use_reverse_index and hasattr(self, 'ri_shards') and self.ri_shards:
             # Note: reverse index only works with a single-document query at this time.
-            pool, shard_results = self.query_reverse_index_shards(query)
-            used_reverse_index = True
+            # Please implement your own best_n.
+            return self.query_reverse_index_shards(query)
 
         else:
             pool, shard_results = self.query_shards(query)
@@ -559,10 +580,7 @@ class Similarity(interfaces.SimilarityABC):
         else:
             # the following uses a lot of lazy evaluation and (optionally) parallel
             # processing, to improve query latency and minimize memory footprint.
-            if used_reverse_index:
-                offsets = numpy.cumsum([0] + [len(shard) for shard in self.ri_shards])
-            else:
-                offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
+            offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
             convert = lambda doc, shard_no: [(doc_index + offsets[shard_no], sim)
                                              for doc_index, sim in doc]
             is_corpus, query = utils.is_corpus(query)

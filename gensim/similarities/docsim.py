@@ -327,12 +327,16 @@ class Similarity(interfaces.SimilarityABC):
                     break
                 row_data = []
                 row_indices = []
+                datum_count = 0
                 for ri_dps_idx in xrange(len(ri_docpart_shards)):
                     row = shard_chunks[ri_dps_idx][shard_row_idx]
-                    row_indices.extend(row.indices)
-                    row_data.extend(row.data)
-                row_indptrs = [0, len(row_data)]
-                ri_row = scipy.sparse.csr_matrix((row_data, row_indices, row_indptrs), shape=(1, num_docs), dtype=numpy.float64)
+                    row_indices.append(row.indices)
+                    row_data.append(row.data)
+                    datum_count += len(row.data)
+                row_indptrs = [0, datum_count]
+                ri_row = scipy.sparse.csr_matrix((numpy.fromiter(itertools.chain.from_iterable(row_data), numpy.float64, count=datum_count),
+                                                  numpy.fromiter(itertools.chain.from_iterable(row_indices), numpy.int64, count=datum_count),
+                                                  numpy.array(row_indptrs)), shape=(1, num_docs), dtype=numpy.float64)
                 ri_row.sort_indices() # We just appended the sparse elements before. Resort.
                 ri_shard_rows.append(ri_row)
 
@@ -490,7 +494,7 @@ class Similarity(interfaces.SimilarityABC):
             if not selections:
                 continue
             # Slice doc rows from that shard for each term.
-            shard_relevant_docs = ri_shard.get_index().index[selections]
+            shard_relevant_docs = ri_shard.get_index().index[numpy.array(selections)]
             relevant_docs.append(shard_relevant_docs)
 
         # vstack returned rows.

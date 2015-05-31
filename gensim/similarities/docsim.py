@@ -478,7 +478,7 @@ class Similarity(interfaces.SimilarityABC):
         return pool, result
 
     def query_reverse_index_shards(self, query):
-        logger.info("DEBUG: querying with query %s" % (query,))
+        #logger.info("DEBUG: querying with query %s" % (query,))
 
         # Slice out the rows we want from the term-order reverse indexes.
         qlen = len(query)
@@ -501,7 +501,7 @@ class Similarity(interfaces.SimilarityABC):
             #logger.info("done querying shard")
             relevant_docs.append(shard_relevant_docs)
 
-        logger.info("vstacking rows and transposing...")
+        #logger.info("vstacking rows and transposing...")
         # vstack returned rows, then transpose and make the whole thing document-order.
         trimmed_corpus = scipy.sparse.vstack(relevant_docs, format='csr').transpose().tocsr()
 
@@ -515,6 +515,7 @@ class Similarity(interfaces.SimilarityABC):
             trimmed_corpus.indices[i] = feature_offset_id_map[trimmed_corpus.indices[i]]
         """
 
+        """
         # Now reindex the features.
         # The below is a fast reindexing solution from the interwebz @
         # http://stackoverflow.com/questions/13572448/change-values-in-a-numpy-array
@@ -527,13 +528,21 @@ class Similarity(interfaces.SimilarityABC):
                                                   feature_offset_id_map[dindex].reshape(trimmed_corpus.indices.shape),
                                                   trimmed_corpus.indptr),
                                                  shape=(len(self), self.num_features))
+        """
 
-        logger.info("foo")
-        logger.info("csr num non-zero elements: %d" % (trimmed_corpus.nnz,))
+        # Fuckin A! Reindexing the query would be way fucking faster, yo!
+        #logger.info("Reindexing query...")
+        #logger.info(query)
+        query = [(i, score) for i, (feature_id, score) in enumerate(query)]
+        #logger.info(query)
+
+        #logger.info("foo")
+        #logger.info("csr num non-zero elements: %d" % (trimmed_corpus.nnz,))
 
         #logger.info("running corpus2csc()...")
         # Change query from gensim sparse format to single-doc csr.
-        query = matutils.corpus2csc([query], num_terms=self.num_features, num_docs=1, num_nnz=len(query))
+        #query = matutils.corpus2csc([query], num_terms=self.num_features, num_docs=1, num_nnz=len(query))
+        query = matutils.corpus2csc([query], num_terms=len(query), num_docs=1, num_nnz=len(query))
 
         #logger.info("performing dot product...")
         result = trimmed_corpus * query # N x T * T x C = N x C

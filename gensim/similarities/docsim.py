@@ -477,6 +477,7 @@ class Similarity(interfaces.SimilarityABC):
             result = imap(query_shard, args)
         return pool, result
 
+
     def query_reverse_index_shards(self, query):
         #logger.info("DEBUG: querying with query %s" % (query,))
 
@@ -505,38 +506,12 @@ class Similarity(interfaces.SimilarityABC):
         # vstack returned rows, then transpose and make the whole thing document-order.
         trimmed_corpus = scipy.sparse.vstack(relevant_docs, format='csr').transpose().tocsr()
 
-        # Now reindex the features.
-        # FIXME: This takes up the majority of the time for large docs. It can take seconds.
-        """
-        logger.info("building mapping...")
-        feature_offset_id_map = array('l', [term[0] for term in query])
-        logger.info("reindexing...")
-        for i in xrange(len(trimmed_corpus.indices)):
-            trimmed_corpus.indices[i] = feature_offset_id_map[trimmed_corpus.indices[i]]
-        """
-
-        """
-        # Now reindex the features.
-        # The below is a fast reindexing solution from the interwebz @
-        # http://stackoverflow.com/questions/13572448/change-values-in-a-numpy-array
-        logger.info("building mapping...")
-        palette = range(len(query))
-        feature_offset_id_map = numpy.array([term[0] for term in query])
-        logger.info("reindexing...")
-        dindex = numpy.digitize(trimmed_corpus.indices, palette, right=True)
-        trimmed_corpus = scipy.sparse.csr_matrix((trimmed_corpus.data,
-                                                  feature_offset_id_map[dindex].reshape(trimmed_corpus.indices.shape),
-                                                  trimmed_corpus.indptr),
-                                                 shape=(len(self), self.num_features))
-        """
-
-        # Fuckin A! Reindexing the query would be way fucking faster, yo!
+        # Reindex query to match size of trimmed corpus matrix, since we
+        # selected only the features from the query.
         #logger.info("Reindexing query...")
         #logger.info(query)
         query = [(i, score) for i, (feature_id, score) in enumerate(query)]
         #logger.info(query)
-
-        #logger.info("foo")
         #logger.info("csr num non-zero elements: %d" % (trimmed_corpus.nnz,))
 
         #logger.info("running corpus2csc()...")

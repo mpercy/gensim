@@ -212,7 +212,7 @@ class Similarity(interfaces.SimilarityABC):
 
     """
     def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768,
-                 use_reverse_index=False):
+                 ri_shardsize=512, use_reverse_index=False):
         """
         Construct the index from `corpus`. The index can be later extended by calling
         the `add_documents` method. **Note**: documents are split (internally, transparently)
@@ -258,6 +258,7 @@ class Similarity(interfaces.SimilarityABC):
         self.normalize = True
         self.chunksize = int(chunksize)
         self.shardsize = shardsize
+        self.ri_shardsize = ri_shardsize
         self.shards = []
         self.fresh_docs, self.fresh_nnz = [], 0
         self.use_reverse_index = use_reverse_index
@@ -275,8 +276,10 @@ class Similarity(interfaces.SimilarityABC):
     def rebuild_reverse_index(self, progress_cnt=10000):
         if not hasattr(self, 'ri_shards'):
             self.ri_shards = []
+        if not hasattr(self, 'ri_shardsize'):
+            self.ri_shardsize = 512
 
-        # Build document-partitioned term-order shards.
+        # Build temporary document-partitioned term-order shards.
         # We need to merge and repartition these still to get a true reverse index.
         ri_docpart_shards = []
         num_shards = len(self.shards)
@@ -285,49 +288,65 @@ class Similarity(interfaces.SimilarityABC):
             logger.info("PROGRESS: reversing index shard #%i of %i" % (shardno, num_shards))
             ri = ReverseIndex(shard.get_index().index.transpose().tocsr(),
                               num_features=self.num_features, num_documents=len(self))
-            ri_shard = ReverseIndexShard("%s.rindex.%d" %
+            ri_shard = ReverseIndexShard("%s.tmp_docpart_rindex.%d" %
                                          (self.output_prefix, len(ri_docpart_shards)), ri)
             ri_docpart_shards.append(ri_shard)
 
         logger.info("=====================================")
 
-        # Now reshard by feature range (still use self.shardsize).
+        # Now reshard by feature range (use self.ri_shardsize).
         self.ri_shards = []
-        num_ri_shards = math.ceil(self.num_features / self.shardsize)
-        for start in xrange(0, self.num_features, self.shardsize):
+        num_ri_shards = math.ceil(self.num_features / self.ri_shardsize)
+        for start_feature in xrange(0, self.num_features, self.ri_shardsize):
             shard_idx = len(self.ri_shards)
-            logger.info("PROGRESS: repartitioning reverse index shard #%i of %i" %
-                        (shard_idx, num_ri_shards))
-            end = min(start + self.shardsize, self.num_features)
+            end_feature = min(start_feature + self.ri_shardsize, self.num_features)
+            logger.info("PROGRESS: repartitioning reverse index shard #%i of %i starting at %d, ending at %d (%d total features in model)" %
+                        (shard_idx, num_ri_shards, start_feature, end_feature, self.num_features))
 
+            logger.info("PROGRESS: taking shard chunks...");
             # Break off chunks of rows from the document-partitioned term-order
-            # shards such that we can build
+            # shards such that we can build the reverse index faster.
             shard_chunks = []
-            for ri_dps in ri_docpart_shards:
-                rows = ri_dps[range(start, end)]
-                shard_chunks.append(rows)
+            for ri_dps_idx, ri_dps in enumerate(ri_docpart_shards):
+                logger.debug("PROGRESS: taking chunk of shard %d..." % (ri_dps_idx,));
+                shard_chunks.append(ri_dps[start_feature:end_feature])
 
             # Build a term-partitioned term-order shard from the chunks.
+            logger.info("PROGRESS: rebuilding term-partitioned shard %d..." % (shard_idx,));
             ri_shard_rows = []
-            for rowoffset in xrange(0, self.shardsize):
-                if rowoffset * (shard_idx + 1) >= self.num_features:
+            for shard_row_idx in xrange(self.ri_shardsize):
+                feature_id = start_feature + shard_row_idx
+                #logger.debug("Saw feature id %d" % (feature_id,))
+                if feature_id >= self.num_features:
+                    logger.debug("Saw feature id %d, breaking. num_features=%d" % (feature_id, self.num_features))
                     break
-                rowidx = rowoffset + start
                 row_data = []
                 row_indices = []
-                for shardidx in range(0, len(ri_docpart_shards)):
-                    row = shard_chunks[shardidx][rowoffset]
+                for ri_dps_idx in xrange(len(ri_docpart_shards)):
+                    row = shard_chunks[ri_dps_idx][shard_row_idx]
                     row_indices.extend(row.indices)
                     row_data.extend(row.data)
                 row_indptrs = [0, len(row_data)]
                 ri_row = scipy.sparse.csr_matrix((row_data, row_indices, row_indptrs), shape=(1, num_docs), dtype=numpy.float64)
                 ri_row.sort_indices() # We just appended the sparse elements before. Resort.
                 ri_shard_rows.append(ri_row)
+
+            if not ri_shard_rows:
+                raise ValueError("Doh")
+            logger.info("PROGRESS: vstacking...")
             ri_shard_index = scipy.sparse.vstack(ri_shard_rows, format='csr')
+
+            logger.info("PROGRESS: building ri...")
             ri = ReverseIndex(ri_shard_index, num_documents = len(self), num_features = len(ri_shard_rows))
+            logger.info("PROGRESS: building ri shard...")
             ri_shard = ReverseIndexShard("%s.rindex.%d" % (self.output_prefix, shard_idx), ri)
 
             self.ri_shards.append(ri_shard)
+
+        # Now delete the temporary files.
+        for tmp_ri_docpart_shard in ri_docpart_shards:
+            os.remove(tmp_ri_docpart_shard.fname)
+
 
     def __len__(self):
         return len(self.fresh_docs) + sum([len(shard) for shard in self.shards])
@@ -446,19 +465,19 @@ class Similarity(interfaces.SimilarityABC):
         return pool, result
 
     def query_reverse_index_shards(self, query):
-        logger.info("DEBUG: querying with query %s" % (query,))
+        logger.debug("DEBUG: querying with query %s" % (query,))
 
         qlen = len(query)
         i = 0
         relevant_docs = []
         for shard_idx, ri_shard in enumerate(self.ri_shards):
-            logger.info("DEBUG: querying shard %s" % (ri_shard.fname,))
-            start = shard_idx * self.shardsize
+            logger.debug("DEBUG: querying shard %s" % (ri_shard.fname,))
+            start = shard_idx * self.ri_shardsize
             end = start + len(ri_shard)
             # accumulate terms that apply to that shard
             selections = []
             while i < qlen and query[i][0] >= start and query[i][0] < end:
-                selections.append(query[i][0])
+                selections.append(query[i][0] - start)
                 i += 1
             # Slice doc rows from that shard for each term.
             shard_relevant_docs = ri_shard.get_index().index[selections]
@@ -470,11 +489,14 @@ class Similarity(interfaces.SimilarityABC):
         for i, rowno in enumerate(rdocs.row):
             rdocs.row[i] = query[rowno][0]
 
-        # HACK: reshape() is not implemented which is a bit silly. This is unsupported but works.
-        rdocs._shape = (self.num_features, len(self))
+        # HACK: reshape() is not implemented for scipy.sparse matrices, which
+        # is a bit silly. This apparently violates encapsulation, but works.
+        # We want to retain the conceptual original # rows after slicing.
+        #rdocs._shape = (self.num_features, len(self))
+
         # Transpose returned docs and change to csr()
         trimmed_corpus = rdocs.tocsc().transpose() # Gives us doc-order csr matrix.
-        #trimmed_corpus._shape = (len(self), self.num_features)
+        trimmed_corpus._shape = (len(self), self.num_features)
 
         # Change query from gensim sparse format to single-doc csr.
         query = matutils.corpus2csc([query], num_terms=self.num_features, num_docs=1, num_nnz=len(query))
@@ -503,9 +525,11 @@ class Similarity(interfaces.SimilarityABC):
             shard.num_best = self.num_best
             shard.normalize = self.normalize
 
-        # Hack that only works with a reverse index and single-document query.
+        used_reverse_index = False
         if self.use_reverse_index and hasattr(self, 'ri_shards') and self.ri_shards:
+            # Note: reverse index only works with a single-document query at this time.
             pool, shard_results = self.query_reverse_index_shards(query)
+            used_reverse_index = True
 
         else:
             pool, shard_results = self.query_shards(query)
@@ -521,14 +545,17 @@ class Similarity(interfaces.SimilarityABC):
         else:
             # the following uses a lot of lazy evaluation and (optionally) parallel
             # processing, to improve query latency and minimize memory footprint.
-            offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
+            if used_reverse_index:
+                offsets = numpy.cumsum([0] + [len(shard) for shard in self.ri_shards])
+            else:
+                offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
             convert = lambda doc, shard_no: [(doc_index + offsets[shard_no], sim)
                                              for doc_index, sim in doc]
             is_corpus, query = utils.is_corpus(query)
             is_corpus = is_corpus or hasattr(query, 'ndim') and query.ndim > 1 and query.shape[0] > 1
             if not is_corpus:
                 # user asked for num_best most similar and query is a single doc
-                results = (convert(result, shard_no) for shard_no, result in enumerate(shard_results))
+                results = [convert(result, shard_no) for shard_no, result in enumerate(shard_results)]
                 result = heapq.nlargest(self.num_best, itertools.chain(*results), key=lambda item: item[1])
             else:
                 # the trickiest combination: returning num_best results when query was a corpus

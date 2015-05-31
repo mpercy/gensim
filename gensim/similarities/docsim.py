@@ -201,6 +201,11 @@ class ReverseIndexShard(utils.SaveLoad):
         index = self.get_index()
         return index[f]
 
+    # Release the mmapped memory for this shard.
+    def release_index(self):
+        if hasattr(self, 'index'):
+            del self.index
+
 class Similarity(interfaces.SimilarityABC):
     """
     Compute cosine similarity of a dynamic query against a static corpus of documents
@@ -337,11 +342,14 @@ class Similarity(interfaces.SimilarityABC):
             ri_shard_index = scipy.sparse.vstack(ri_shard_rows, format='csr')
 
             logger.info("PROGRESS: building ri...")
-            ri = ReverseIndex(ri_shard_index, num_documents = len(self), num_features = len(ri_shard_rows))
+            ri = ReverseIndex(ri_shard_index, num_features = len(ri_shard_rows), num_documents = len(self))
             logger.info("PROGRESS: building ri shard...")
             ri_shard = ReverseIndexShard("%s.rindex.%d" % (self.output_prefix, shard_idx), ri)
 
             self.ri_shards.append(ri_shard)
+
+            # Unload the mmap to reduce memory pressure while rebuilding.
+            ri_shard.release_index()
 
         # Now delete the temporary files.
         for tmp_ri_docpart_shard in ri_docpart_shards:
@@ -479,6 +487,8 @@ class Similarity(interfaces.SimilarityABC):
             while i < qlen and query[i][0] >= start and query[i][0] < end:
                 selections.append(query[i][0] - start)
                 i += 1
+            if not selections:
+                continue
             # Slice doc rows from that shard for each term.
             shard_relevant_docs = ri_shard.get_index().index[selections]
             relevant_docs.append(shard_relevant_docs)

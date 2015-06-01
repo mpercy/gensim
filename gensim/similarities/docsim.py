@@ -459,19 +459,26 @@ class Similarity(interfaces.SimilarityABC):
     def query_reverse_index_shards(self, query):
         logger.debug("querying with query %s", query)
 
+        if not query:
+            logger.debug("query is empty")
+            return numpy.array([])
+
         # Slice out the rows we want from the term-order reverse indexes.
         qlen = len(query)
+
         i = 0
         relevant_docs = []
+        shard_start = 0
         for shard_idx, ri_shard in enumerate(self.ri_shards):
             #logger.debug("DEBUG: querying shard %s", ri_shard.fname)
-            start = shard_idx * self.ri_shardsize
-            end = start + len(ri_shard)
+            shard_end = shard_start + len(ri_shard)
             # accumulate terms that apply to that shard
             selections = []
-            while i < qlen and query[i][0] >= start and query[i][0] < end:
-                selections.append(query[i][0] - start)
+            while i < qlen and query[i][0] >= shard_start and query[i][0] < shard_end:
+                selections.append(query[i][0] - shard_start)
                 i += 1
+            shard_start = shard_end
+
             if not selections:
                 continue
             #logger.debug("querying shard %d with selections: %s", shard_idx, selections)
@@ -479,6 +486,10 @@ class Similarity(interfaces.SimilarityABC):
             shard_relevant_docs = ri_shard.get_index().index[numpy.array(selections)]
             #logger.debug("done querying shard")
             relevant_docs.append(shard_relevant_docs)
+
+        if qlen > 0 and not relevant_docs:
+            logger.warning("Found no docs in corpus containing query terms?")
+            return np.array([])
 
         logger.debug("vstacking rows and transposing...")
         # vstack returned rows, then transpose and make the whole thing document-order.

@@ -461,7 +461,7 @@ class Similarity(interfaces.SimilarityABC):
 
         if not query:
             logger.debug("query is empty")
-            return numpy.array([])
+            return numpy.zeros(len(self), dtype=numpy.float64)
 
         # Slice out the rows we want from the term-order reverse indexes.
         qlen = len(query)
@@ -489,7 +489,7 @@ class Similarity(interfaces.SimilarityABC):
 
         if qlen > 0 and not relevant_docs:
             logger.warning("Found no docs in corpus containing query terms?")
-            return np.array([])
+            return numpy.zeros(len(self), dtype=numpy.float64)
 
         logger.debug("vstacking rows and transposing...")
         # vstack returned rows, then transpose and make the whole thing document-order.

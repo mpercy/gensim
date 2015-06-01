@@ -516,6 +516,15 @@ class Similarity(interfaces.SimilarityABC):
         return result
 
 
+    def preload_reverse_index(self):
+        """
+        Simply ensure all indexes are mmapped.
+        This is not strictly required, it just keeps query latency more consistent.
+        """
+        for ri_shard in self.ri_shards:
+            ri_shard.get_index()
+
+
     def docs_by_feature_id(self, feature_id):
         """
         Return indexed vector corresponding to documents with feature `feature_id`.

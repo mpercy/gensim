@@ -287,57 +287,47 @@ class Similarity(interfaces.SimilarityABC):
 
         # Build temporary document-partitioned term-order shards.
         # We need to merge and repartition these still to get a true reverse index.
-        ri_docpart_shards = []
-        num_shards = len(self.shards)
-        num_docs = len(self)
+        rev_docpart_index_shards = []
         for shardno, shard in enumerate(self.shards):
-            logger.info("PROGRESS: reversing index shard #%i of %i" % (shardno, num_shards))
+            logger.info("PROGRESS: reversing index shard #%i of %i" % (shardno, len(self.shards)))
             ri = ReverseIndex(shard.get_index().index.transpose().tocsr(),
                               num_features=self.num_features, num_documents=len(self))
             ri_shard = ReverseIndexShard("%s.tmp_docpart_rindex.%d" %
-                                         (self.output_prefix, len(ri_docpart_shards)), ri)
-            ri_docpart_shards.append(ri_shard)
+                                         (self.output_prefix, len(rev_docpart_index_shards)), ri)
+            rev_docpart_index_shards.append(ri_shard)
 
         logger.info("=====================================")
 
         # Now reshard by feature range (use self.ri_shardsize).
+        num_docs = len(self)
         self.ri_shards = []
         num_ri_shards = math.ceil(self.num_features / self.ri_shardsize)
-        for start_feature in xrange(0, self.num_features, self.ri_shardsize):
+        for start_feature in range(0, self.num_features, self.ri_shardsize):
             shard_idx = len(self.ri_shards)
             end_feature = min(start_feature + self.ri_shardsize, self.num_features)
             logger.info("PROGRESS: repartitioning reverse index shard #%i of %i starting at %d, ending at %d (%d total features in model)" %
                         (shard_idx, num_ri_shards, start_feature, end_feature, self.num_features))
 
+            """
             logger.info("PROGRESS: taking shard chunks...");
             # Break off chunks of rows from the document-partitioned term-order
             # shards such that we can build the reverse index faster.
             shard_chunks = []
-            for ri_dps_idx, ri_dps in enumerate(ri_docpart_shards):
+            for ri_dps_idx, ri_dps in enumerate(rev_docpart_index_shards):
                 logger.debug("PROGRESS: taking chunk of shard %d..." % (ri_dps_idx,));
                 shard_chunks.append(ri_dps[start_feature:end_feature])
+            """
 
             # Build a term-partitioned term-order shard from the chunks.
             logger.info("PROGRESS: rebuilding term-partitioned shard %d..." % (shard_idx,));
             ri_shard_rows = []
-            for shard_row_idx in xrange(self.ri_shardsize):
-                feature_id = start_feature + shard_row_idx
+            for feature_offset in range(self.ri_shardsize):
+                feature_id = start_feature + feature_offset
                 #logger.debug("Saw feature id %d" % (feature_id,))
                 if feature_id >= self.num_features:
                     logger.debug("Saw feature id %d, breaking. num_features=%d" % (feature_id, self.num_features))
                     break
-                row_data = []
-                row_indices = []
-                datum_count = 0
-                for ri_dps_idx in xrange(len(ri_docpart_shards)):
-                    row = shard_chunks[ri_dps_idx][shard_row_idx]
-                    row_indices.append(row.indices)
-                    row_data.append(row.data)
-                    datum_count += len(row.data)
-                row_indptrs = [0, datum_count]
-                ri_row = scipy.sparse.csr_matrix((numpy.fromiter(itertools.chain.from_iterable(row_data), numpy.float64, count=datum_count),
-                                                  numpy.fromiter(itertools.chain.from_iterable(row_indices), numpy.int64, count=datum_count),
-                                                  numpy.array(row_indptrs)), shape=(1, num_docs), dtype=numpy.float64)
+                ri_row = scipy.sparse.hstack([ri_dps[feature_id] for ri_dps in rev_docpart_index_shards], format='csr')
                 ri_row.sort_indices() # We just appended the sparse elements before. Resort.
                 ri_shard_rows.append(ri_row)
 
@@ -357,7 +347,7 @@ class Similarity(interfaces.SimilarityABC):
             ri_shard.release_index()
 
         # Now delete the temporary files.
-        for tmp_ri_docpart_shard in ri_docpart_shards:
+        for tmp_ri_docpart_shard in rev_docpart_index_shards:
             os.remove(tmp_ri_docpart_shard.fname)
 
 

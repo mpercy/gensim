@@ -279,11 +279,9 @@ class Similarity(interfaces.SimilarityABC):
             self.add_documents(corpus)
 
     # Rebuild the reverse index (or build one if it was never built).
-    def rebuild_reverse_index(self, progress_cnt=10000):
-        if not hasattr(self, 'ri_shards'):
-            self.ri_shards = []
-        if not hasattr(self, 'ri_shardsize'):
-            self.ri_shardsize = 512
+    def rebuild_reverse_index(self, progress_cnt=10000, ri_shardsize=512):
+        self.ri_shards = []
+        self.ri_shardsize = ri_shardsize
 
         # Build temporary document-partitioned term-order shards.
         # We need to merge and repartition these still to get a true reverse index.
@@ -307,16 +305,6 @@ class Similarity(interfaces.SimilarityABC):
             end_feature = min(start_feature + self.ri_shardsize, self.num_features)
             logger.info("PROGRESS: repartitioning reverse index shard #%i of %i starting at %d, ending at %d (%d total features in model)" %
                         (shard_idx, num_ri_shards, start_feature, end_feature, self.num_features))
-
-            """
-            logger.info("PROGRESS: taking shard chunks...");
-            # Break off chunks of rows from the document-partitioned term-order
-            # shards such that we can build the reverse index faster.
-            shard_chunks = []
-            for ri_dps_idx, ri_dps in enumerate(rev_docpart_index_shards):
-                logger.debug("PROGRESS: taking chunk of shard %d..." % (ri_dps_idx,));
-                shard_chunks.append(ri_dps[start_feature:end_feature])
-            """
 
             # Build a term-partitioned term-order shard from the chunks.
             logger.info("PROGRESS: rebuilding term-partitioned shard %d..." % (shard_idx,));
@@ -458,7 +446,7 @@ class Similarity(interfaces.SimilarityABC):
         """
         args = zip([query] * len(self.shards), self.shards)
         if PARALLEL_SHARDS and PARALLEL_SHARDS > 1:
-            logger.debug("spawning %i query processes" % PARALLEL_SHARDS)
+            logger.debug("spawning %i query processes", PARALLEL_SHARDS)
             pool = multiprocessing.Pool(PARALLEL_SHARDS)
             result = pool.imap(query_shard, args, chunksize=1 + len(args) / PARALLEL_SHARDS)
         else:
@@ -469,14 +457,14 @@ class Similarity(interfaces.SimilarityABC):
 
 
     def query_reverse_index_shards(self, query):
-        #logger.info("DEBUG: querying with query %s" % (query,))
+        logger.debug("querying with query %s", query)
 
         # Slice out the rows we want from the term-order reverse indexes.
         qlen = len(query)
         i = 0
         relevant_docs = []
         for shard_idx, ri_shard in enumerate(self.ri_shards):
-            #logger.debug("DEBUG: querying shard %s" % (ri_shard.fname,))
+            #logger.debug("DEBUG: querying shard %s", ri_shard.fname)
             start = shard_idx * self.ri_shardsize
             end = start + len(ri_shard)
             # accumulate terms that apply to that shard
@@ -486,36 +474,34 @@ class Similarity(interfaces.SimilarityABC):
                 i += 1
             if not selections:
                 continue
-            #logger.info("querying shard %d with selections: %s" % (shard_idx, selections))
+            #logger.debug("querying shard %d with selections: %s", shard_idx, selections)
             # Slice doc rows from that shard for each term.
             shard_relevant_docs = ri_shard.get_index().index[numpy.array(selections)]
-            #logger.info("done querying shard")
+            #logger.debug("done querying shard")
             relevant_docs.append(shard_relevant_docs)
 
-        #logger.info("vstacking rows and transposing...")
+        logger.debug("vstacking rows and transposing...")
         # vstack returned rows, then transpose and make the whole thing document-order.
         trimmed_corpus = scipy.sparse.vstack(relevant_docs, format='csr').transpose().tocsr()
 
         # Reindex query to match size of trimmed corpus matrix, since we
         # selected only the features from the query.
-        #logger.info("Reindexing query...")
-        #logger.info(query)
+        logger.debug("Reindexing query...")
+        logger.debug(query)
         query = [(i, score) for i, (feature_id, score) in enumerate(query)]
-        #logger.info(query)
-        #logger.info("csr num non-zero elements: %d" % (trimmed_corpus.nnz,))
+        logger.debug(query)
+        logger.debug("trimmed corpus # non-zero elements: %d", trimmed_corpus.nnz)
 
-        #logger.info("running corpus2csc()...")
+        logger.debug("running corpus2csc()...")
         # Change query from gensim sparse format to single-doc csr.
-        #query = matutils.corpus2csc([query], num_terms=self.num_features, num_docs=1, num_nnz=len(query))
         query = matutils.corpus2csc([query], num_terms=len(query), num_docs=1, num_nnz=len(query))
 
-        #logger.info("performing dot product...")
+        logger.debug("performing dot product to compute similarity to relevant docs...")
         result = trimmed_corpus * query # N x T * T x C = N x C
-        #logger.info("flattening...")
+        logger.debug("flattening...")
         result = result.toarray().flatten()
-        #result = sklearn.metrics.pairwise.cosine_similarity(trimmed_corpus, query).flatten()
 
-        #logger.info("returning...")
+        logger.debug("returning...")
         return result
 
 
